@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+
+# BSD 2-Clause License
+#
+# Copyright (c) 2022 Thomas Hurst
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import signal
+import sys
+import time
+
+# We have little interesting to do with these signals - restore default handlers
+# so our WIFSIGNALED() state propagates properly to the shell
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+# Docs warn against this, but we're not writing to anything but stdout/err.
+# If we ever need to restore standard Python behaviour, catch BrokenPipeError in
+# our print() calls, restore the handler and then re-raise the signal.
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+################################################################################
+# Column and number formatting is taken directly from my ioztat code.
+# Any bugfixes should be sent upstream.
+
+class Column:
+    """
+    Formats (translates raw value to string) and optionally justifies (adjusts
+    the string to fit within a given width) a single column.
+    """
+    def __init__(self, key, heading, width=0, format=str, just=None):
+        self.key = key
+        self.heading = heading
+        self.width = width
+        self.format = format
+        self.just = just
+
+    def render(self, values):
+        return self.justify(str(self.format(values[self.key])))
+
+    def render_heading(self):
+        return self.justify(self.heading)
+
+    def justify(self, string):
+        return self.just(string, self.width) if self.just else string
+
+
+class ColumnGroup:
+    """
+    A simplified column that justifies a string to span the set of Column
+    objects it is meant to cover.  Does not support formatting.
+
+    Width here is the size of separators not covered by the raw width of the
+    spanned columns themselves.
+    """
+    def __init__(self, heading, columns, width=0, just=str.center):
+        self.heading = heading
+        self.columns = columns
+        self.width = width
+        self.just = just
+
+    def group_width(self):
+        return self.width + sum((c.width for c in self.columns))
+
+    def render_heading(self):
+        return self.justify(self.heading)
+
+    def justify(self, string):
+        return self.just(string, self.group_width()) if self.just else string
+
+
+class ColumnFormatter:
+    """
+    A buffered formatter for columnar data with optional group headings.
+    """
+    def __init__(self, column_separator='  ', row_separator='-', buffer=None):
+        self.columns = []
+        self.column_index = {}
+        self.groups = None
+        self.column_separator = column_separator
+        self.row_separator = row_separator
+        self.buffer = buffer if buffer is not None else []
+
+    def add_column(self, name, cls=Column, **args):
+        self.column_index[name] = len(self.columns)
+        self.columns.append(cls(name, **args))
+
+    def add_group(self, name='', colspan=1, just=str.center):
+        """Add a group heading that spans the previous colspan columns"""
+        if self.groups is None:
+            self.groups = ColumnFormatter(column_separator=self.column_separator,
+                                          buffer=self.buffer)
+
+        self.groups.add_column(name, cls=ColumnGroup, columns=self.columns[-colspan:],
+                               width=len(self.column_separator) * (colspan - 1), just=just)
+
+    def set_column_width(self, key, width):
+        """Set the width of the column"""
+        self.columns[self.column_index[key]].width = width
+
+    def get_printed_width(self, exclude=()):
+        """
+        Return the printed width of columns and their separators, excluding the
+        keys in exclude.
+        """
+        return sum((c.width + len(self.column_separator)
+                   for c in self.columns
+                   if c.key not in exclude))
+
+    def print_row(self, **data):
+        """Add a row of data to be formatted into the internal buffer"""
+        formatted = (column.render(data) for column in self.columns)
+        self.print(self.column_separator.join(formatted))
+
+    def print_header(self):
+        """Add headings and optionally group headings to the internal buffer"""
+        if self.groups:
+            self.groups.print_header()
+
+        formatted = (column.render_heading() for column in self.columns)
+        self.print(self.column_separator.join(formatted))
+
+    def print_divider(self):
+        """
+        Add a line of column_separator in the space given to each column to the
+        internal buffer.
+        """
+        self.print(
+            self.column_separator.join(
+                [''.ljust(c.width, self.row_separator) for c in self.columns]))
+
+    def print(self, string, end="\n"):
+        """
+        Adds the specified string to the internal buffer.
+
+        Must eventually be followed by a call to flush()
+        """
+        self.buffer.append(str(string) + end)
+
+    def flush(self, lines=None):
+        """Print the internal buffer, up to the optional lines limit."""
+        buffer = ''.join(self.buffer)
+        if lines:
+            buffer = "\n".join(buffer.split("\n", lines)[:lines])
+        print(buffer, end='')
+        self.buffer.clear()
+
+
+class NumberToHuman:
+    """Number formatting functions"""
+
+    SIZE_PREFIX = ('', 'K', 'M', 'G', 'T', 'P', 'E')
+    FORMATS = ('{:.2f}{}', '{:.1f}{}', '{:.0f}{}')
+
+    @classmethod
+    def formatter(cls, length, decimal=False):
+        """
+        Return a function that will format a number to a shortened SI decimal or
+        binary form that fits within a given length.
+        """
+        divisor = 1000 if decimal else 1024
+        formats = cls.FORMATS
+        size_prefix = cls.SIZE_PREFIX
+        size_prefix_max = len(size_prefix) - 1
+        powers = [pow(divisor, i) for i in range(len(size_prefix))]
+
+        def fmt(num):
+            n = num
+            index = 0
+            while n >= divisor and index < size_prefix_max:
+                n /= divisor
+                index += 1
+
+            u = size_prefix[index]
+
+            if index == 0 or num % powers[index] == 0:
+                return str(int(n)) + u
+
+            for fmt in formats:
+                ret = fmt.format(n, u)
+                if len(ret) <= length:
+                    return ret
+            return ret
+        return fmt
+
+################################################################################
+try:
+    import sysctl
+
+    def fetch_sysctl(oids):
+        return (value for oid in oids for value in sysctl.filter(oid))
+
+except ImportError:
+    import subprocess
+    from collections import namedtuple
+
+    SysctlValue = namedtuple('SysctlValue', ['name', 'value'])
+
+    def fetch_sysctl(oids):
+        r = subprocess.run(['/sbin/sysctl', '-e', '--', *oids],
+                capture_output=True, check=False, encoding='latin-1')
+        stats = (line.split("=", 2) for line in r.stdout.split("\n"))
+        return (SysctlValue(*nv) for nv in stats if len(nv) == 2)
+
+from collections import defaultdict
+
+def remove_prefix(text, prefix):
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+def fetch_domains():
+    domains = defaultdict(dict)
+    for ctl in fetch_sysctl(['vm.domain.']):
+        name = remove_prefix(ctl.name, 'vm.domain.').split('.')
+        if len(name) == 3:
+            domain, kind, stat = name
+            domains[int(domain)]['.'.join((kind, stat))] = ctl.value
+
+    return domains
+
+def create_column_formatter():
+    field_width = 8
+    bytes_format = NumberToHuman.formatter(length=field_width, decimal=False)
+    pages_format = lambda x: bytes_format(4096 * int(x))
+
+    page = {'width': field_width, 'just': str.rjust, 'format': pages_format}
+
+    formatter= ColumnFormatter()
+    formatter.add_column('domain', heading='DOMAIN', width=6, just=str.rjust)
+    formatter.add_column('stats.active', heading='ACTIVE', **page)
+    formatter.add_column('stats.inactive', heading='INACTIVE', **page)
+    formatter.add_column('stats.laundry', heading='LAUNDRY', **page)
+    formatter.add_column('stats.free_count', heading='FREE', **page)
+
+    return formatter
+
+def interval(seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        yield
+        sleep = deadline - time.monotonic()
+        if sleep > 0:
+            time.sleep(sleep)
+            deadline += seconds
+        else:
+            deadline = time.monotonic() + seconds
+
+def main():
+    formatter = create_column_formatter()
+    formatter.print_header()
+
+    delay = 1.0
+    if len(sys.argv) == 2:
+      try:
+        delay = float(sys.argv[1])
+      except ValueError:
+        print("Usage: numastat [interval]", file=sys.stderr)
+        sys.exit(1)
+
+    for domains in (fetch_domains() for _ in interval(delay)):
+        formatter.print_divider()
+        for domain, stats in sorted(domains.items()):
+            formatter.print_row(domain=domain, **stats)
+
+        formatter.flush()
+
+
+if __name__ == '__main__':
+    main()
